@@ -52,7 +52,7 @@ def simulate(s_infections_true, n_pop, symp_kernel_true, cc_kernel_true, cc_day_
 
 
 def model(data):
-    X_smooth = [pm.Uniform(f'X_smooth_{i}', 0, data.n_pop, value=10*data.n_cc.iloc[i]) for i in range(len(data))]
+    X_smooth = [pm.Uniform(f'X_smooth_{i}', .1, data.n_pop, value=np.clip(10*data.n_cc.iloc[i], 1, data.n_pop.iloc[i])) for i in range(len(data))]
     
     # potential to smooth X with
     # some appropriate smoothing prior
@@ -88,7 +88,7 @@ def model(data):
 
     @pm.potential
     def symp_days_to_infection_ratio(symp_kernel=symp_kernel):
-        return pm.normal_like(symp_kernel.sum(), 5, .2**-2)
+        return pm.normal_like(symp_kernel.sum(), 5, .2**-2)  # TODO: evaluate evidence base for this prior, refactor into symp_kernel_amp prior
 
     @pm.deterministic(trace=True)
     def mu_symp(X=X, symp_kernel=symp_kernel):
@@ -110,20 +110,22 @@ def model(data):
 
     @pm.potential
     def cc_to_infection_ratio(cc_kernel=cc_kernel):
-        return pm.normal_like(cc_kernel.sum(), 0.1, .02**-2)
+        return pm.normal_like(cc_kernel.sum(), 0.1, .02**-2)  # TODO: evaluate evidence base for this prior, refactor into cc_kernel_amp prior
     
     @pm.deterministic(trace=True)
-    def mu_cc(X=X, cc_kernel=cc_kernel, beta_dow_cc=beta_dow_cc):
-        cc_smooth = my_convolve(X, cc_kernel)
+    def mu_cc_smooth(X=X, cc_kernel=cc_kernel):
+        return my_convolve(X, cc_kernel)
+    @pm.deterministic(trace=True)
+    def mu_cc(mu_cc_smooth=mu_cc_smooth, beta_dow_cc=beta_dow_cc):
         return apply_day_of_week_effect(
-            cc_smooth, beta_dow_cc, dow) + 1e-3 # add small offset to prevent zero-probability error
+            mu_cc_smooth, beta_dow_cc, dow) + 1e-3 # add small offset to prevent zero-probability error
     @pm.observed
-    def y_cc(mu=mu_cc, value=data.n_cc):
+    def y_cc(mu=mu_cc, value=np.clip(data.n_cc, 0, data.n_pop)):
         return pm.poisson_like(value[10:], mu[10:])
     
     return locals()
 
-def fit(var_dict, verbose=False):
+def fit(var_dict, verbose=False, fast=False):
     m = pm.MCMC(var_dict)
     m.use_step_method(pm.AdaptiveMetropolis, m.symp_kernel_knots[1:])
     m.use_step_method(pm.AdaptiveMetropolis, m.cc_kernel_knots[2:])
@@ -133,23 +135,120 @@ def fit(var_dict, verbose=False):
     for i in range(5):
         pm.MAP([m.y_cc, m.y_symp, m.X_smooth,
                 m.X_smooth_potential]).fit(method='fmin_powell', verbose=verbose)
-        pm.MAP([m.y_cc, m.y_symp, m.cc_kernel_knots
+        pm.MAP([m.y_cc, m.y_symp, m.cc_kernel_knots, m.cc_kernel_amp, m.cc_to_infection_ratio,
                ]).fit(method='fmin_powell', verbose=verbose)
-        pm.MAP([m.y_cc, m.y_symp, m.symp_kernel_knots
+        pm.MAP([m.y_cc, m.y_symp, m.symp_kernel_knots, m.symp_kernel_amp, m.symp_days_to_infection_ratio,
                ]).fit(method='fmin_powell', verbose=verbose)
         pm.MAP([m.y_cc, m.y_symp, m.X_smooth,
                 m.X_smooth_potential, m.beta_dow_cc_nonzero]).fit(method='fmin_powell', verbose=1)
 
     pm.MAP(var_dict).fit(method='fmin_powell', verbose=1)
 
-    m.sample(50_000, 20_000, 30)
+    if fast:
+        m.sample(10)
+    else:
+        m.sample(50_000, 20_000, 30)
 
     return m
 
-def my_plot(stoch, xx):
+def my_plot(stoch, xx, color='C0', label='Predicted'):
     s_mean = stoch.trace().mean(axis=0)
     s_lb, s_ub = pm.utils.hpd(stoch.trace(), 0.05)
-    plt.plot(xx, s_mean, '-', color='C0', label='Predicted', zorder=3)
-    plt.plot(xx, s_lb, '--', color='C0', zorder=3)
-    plt.plot(xx, s_ub, '--', color='C0', zorder=3)
+    plt.plot(xx, s_mean, '-', color=color, label=label, zorder=3)
+    plt.plot(xx, s_lb, '--', color=color, zorder=3)
+    plt.plot(xx, s_ub, '--', color=color, zorder=3)
+
+
+def etl_state(loc_name, loc_abbr, df_full_data, df_fb_data, df_zip):
+    """Create input data for selected state
+
+    To load data files, try::
+
+        df_full_data = pd.read_csv('/ihme/covid-19/model-inputs/best/full_data.csv')
+        df_fb_data = pd.read_csv('/home/j/Project/simulation_science/covid/data/fb_data_usa.csv', index_col=0, low_memory=False)
+        df_zip = pd.read_csv('/home/j/Project/simulation_science/covid/data/ZIP-COUNTY-FIPS_2018-03.csv')
+    """
+    data = pd.DataFrame()
+
+    # first two columns come from IHME COVID-19 Projection Model Inputs
+    df = df_full_data
+    t = df[df['Province/State'] == loc_name]
+    data['n_pop'] = t['population']
+    data['n_cc'] = t['Confirmed'].diff()
+    data.index = t['Date'].map(pd.Timestamp)
+
+    # next two columns come from FB data
+    df = df_fb_data
+    if not 'zip5' in df.columns:
+        def to_five(s):
+            if pd.isna(s):
+                return np.nan
+            return int(str(s)[:5])
+        df['zip5'] = df.zipcode.map(to_five)
+    if not 'state' in df.columns:
+        df['state'] = df.zip5.fillna(0).map(df_zip.groupby('ZIP').STATE.first())
+
+    t = df.groupby(['state', 'date']).smell_taste_loss.describe().filter(['count', 'mean'])
+    t = t.reset_index()
+    t = t[t.state == loc_abbr]
+    t.index = t.date.map(pd.Timestamp)
+
+    data['n_sampled'] = t['count']
+    data['n_symp'] = t['count']*t['mean']
+    data = data.dropna()
+
+    return data
+
+
+def summarize_results(m):
+    out_data = m.data.filter(['n_cc', 'n_symp']).copy()
+    out_data['cases_wo_day_of_week_effect'] = m.mu_cc_smooth.trace().mean(axis=0)
+    out_data['smoothed_symptomatic_infections'] = m.mu_symp.trace().mean(axis=0)
+    out_data['new_infections'] = m.X.trace().mean(axis=0)
+    out_data = out_data.iloc[14:]
+    return out_data
+
+
+def make_plots(m):
+    plt.figure(figsize=(8.25, 4.), dpi=120)
+    my_plot(m.X, m.data.index)
+    plt.grid()
+    plt.ylabel('New Infections')
+    plt.axis(ymin=0)
+
+
+    plt.figure(figsize=(8.25, 4.), dpi=120)
+    my_plot(m.mu_symp, m.data.index)
+    m.data.n_symp.plot(label='Observed', color='grey', marker='s', zorder=2)
+    
+    plt.legend(loc=(1.01, .01))
+    plt.grid()
+    plt.ylabel('Symptomatic in Sample')
+
+
+    plt.figure(figsize=(8.25, 4.), dpi=120)
+
+    my_plot(m.mu_cc, m.data.index, 'C0', 'Predicted')
+    my_plot(m.mu_cc_smooth, m.data.index, 'C1', 'Without day-of-week effect')
+    m.data.n_cc.plot(label='Observed', color='grey', marker='s', zorder=2)
+    
+    plt.legend(loc=(1.01, .01))
+    plt.grid()
+    plt.ylabel('New Confirmed Cases')
+
+
+    plt.figure(figsize=(8.25, 4.), dpi=120)
+
+    my_plot(m.beta_dow_cc, range(7))
+
+    plt.grid()
+    plt.ylabel('Day of week effects')
+
+
+    plt.figure(figsize=(8.25, 4.), dpi=120)
+    my_plot(m.cc_kernel, range(21), 'C0', 'Convolution kernel for confirmed cases')
+    plt.grid()
+    my_plot(m.symp_kernel, range(21), 'C1', 'Convolution kernel for symptoms')
+
+    plt.legend(loc=(1.01, .01))
 
