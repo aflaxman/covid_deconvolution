@@ -52,7 +52,9 @@ def simulate(s_infections_true, n_pop, symp_kernel_true, cc_kernel_true, cc_day_
 
 
 def model(data):
-    X_smooth = [pm.Uniform(f'X_smooth_{i}', .1, data.n_pop, value=np.clip(10*data.n_cc.iloc[i], 1, data.n_pop.iloc[i])) for i in range(len(data))]
+    X_smooth = [pm.Uniform(f'X_smooth_{i}', .1, data.n_pop,
+                           value=np.clip(10*data.n_cc.iloc[i], 1, data.n_pop.iloc[i]))
+                for i in range(len(data))]
     
     # potential to smooth X with
     # some appropriate smoothing prior
