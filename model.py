@@ -151,6 +151,7 @@ def fit(var_dict, verbose=False, fast=False):
 
     return m
 
+
 def my_plot(stoch, xx, color='C0', label='Predicted'):
     s_mean = stoch.trace().mean(axis=0)
     s_lb, s_ub = pm.utils.hpd(stoch.trace(), 0.05)
@@ -188,7 +189,10 @@ def etl_state(loc_name, loc_abbr, df_full_data, df_fb_data, df_zip):
     if not 'state' in df.columns:
         df['state'] = df.zip5.fillna(0).map(df_zip.groupby('ZIP').STATE.first())
 
-    t = df.groupby(['state', 'date']).smell_taste_loss.describe().filter(['count', 'mean'])
+    # TODO: search systematically for informative syndromes
+    df['no_smell_not_congested'] = df.smell_taste_loss & ~df.nasal_congest
+
+    t = df.groupby(['state', 'date']).no_smell_not_congested.describe().filter(['count', 'mean'])
     t = t.reset_index()
     t = t[t.state == loc_abbr]
     t.index = t.date.map(pd.Timestamp)
